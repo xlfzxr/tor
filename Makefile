@@ -13,7 +13,7 @@ vet:
 	go vet ./...
 
 test:
-	go test ./... 2>/dev/null || echo "(no go tests yet — vet+build OK)"
+	go test ./...
 
 install: build
 	mkdir -p $(INSTALL_DIR)
