@@ -47,6 +47,7 @@ torstack rotate
 torstack env                    # export proxy untuk shell ini
 eval "$(torstack env)"          # suntik proxy ke terminal ini
 torstack watchdog               # Ctrl-C untuk berhenti
+torstack watchdog --autorotate 600   # jaga hidup + NEWNYM tiap 10 menit
 torstack --config configs/default.json status
 ```
 
@@ -69,6 +70,7 @@ Prioritas: flags > env > file JSON `--config` > default bawaan.
 | `--tor-config` | `TORSTACK_TOR_CONFIG` | `/etc/tor/torrc`, path Termux, … |
 | `--privoxy-config` | `TORSTACK_PRIVOXY_CONFIG` | `/etc/privoxy/config`, path Termux, … |
 | `--watch-interval N` | `TORSTACK_WATCH_INTERVAL` | `15` (detik) |
+| `--autorotate N` | `TORSTACK_AUTOROTATE` | `0` = mati (detik, min 10) |
 | `--control-addr` | `TORSTACK_CONTROL_ADDR` | `127.0.0.1:9051` |
 | `--control-pass` | `TORSTACK_CONTROL_PASSWORD` | kosong |
 | `--debug` | `TORSTACK_DEBUG=1` | false |

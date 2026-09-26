@@ -20,7 +20,11 @@ type Config struct {
 	LogDir            string        `json:"log_dir"`
 	WatchdogInterval  time.Duration `json:"-"`
 	// raw for JSON (seconds) so config file stays simple
-	WatchdogSeconds int    `json:"watchdog_interval_seconds"`
+	WatchdogSeconds int `json:"watchdog_interval_seconds"`
+	// AutorotateInterval is the NEWNYM period; <=0 disables auto-rotate.
+	AutorotateInterval time.Duration `json:"-"`
+	// raw for JSON (seconds); 0 = off (default: manual `rotate` only)
+	AutorotateSeconds int           `json:"autorotate_seconds"`
 	TorSOCKSAddr    string `json:"tor_socks_addr"`
 	PrivoxyAddr     string `json:"privoxy_addr"`
 	TorControlAddr  string `json:"tor_control_addr"`
@@ -88,6 +92,9 @@ func Load(path string) (Config, error) {
 	if cfg.WatchdogSeconds > 0 {
 		cfg.WatchdogInterval = time.Duration(cfg.WatchdogSeconds) * time.Second
 	}
+	if cfg.AutorotateSeconds > 0 {
+		cfg.AutorotateInterval = time.Duration(cfg.AutorotateSeconds) * time.Second
+	}
 	applyEnv(&cfg)
 	return cfg, nil
 }
@@ -111,6 +118,10 @@ func merge(dst *Config, src Config) {
 	if src.WatchdogSeconds > 0 {
 		dst.WatchdogSeconds = src.WatchdogSeconds
 		dst.WatchdogInterval = time.Duration(src.WatchdogSeconds) * time.Second
+	}
+	if src.AutorotateSeconds > 0 {
+		dst.AutorotateSeconds = src.AutorotateSeconds
+		dst.AutorotateInterval = time.Duration(src.AutorotateSeconds) * time.Second
 	}
 	if src.TorSOCKSAddr != "" {
 		dst.TorSOCKSAddr = src.TorSOCKSAddr
@@ -164,6 +175,12 @@ func applyEnv(cfg *Config) {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.WatchdogSeconds = n
 			cfg.WatchdogInterval = time.Duration(n) * time.Second
+		}
+	}
+	if v := os.Getenv("TORSTACK_AUTOROTATE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.AutorotateSeconds = n
+			cfg.AutorotateInterval = time.Duration(n) * time.Second
 		}
 	}
 	if v := os.Getenv("TORSTACK_DEBUG"); v == "1" || strings.EqualFold(v, "true") {

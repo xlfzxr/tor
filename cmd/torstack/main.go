@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -28,6 +29,7 @@ var (
 	flagControlAddr  = flag.String("control-addr", "", "override tor ControlPort addr")
 	flagControlPass  = flag.String("control-pass", "", "override tor ControlPort password")
 	flagWatchOnce    = flag.Bool("once", false, "watchdog: single check pass and exit")
+	flagAutorotate   = flag.Int("autorotate", 0, "watchdog: NEWNYM period in seconds (0 = off, min 10)")
 	flagDoctorVerb   = flag.Bool("v", false, "doctor: verbose protocol checks")
 )
 
@@ -53,12 +55,23 @@ func main() {
 	rest := args[1:]
 	// allow `doctor -v` as positional too
 	verbose := *flagDoctorVerb
-	for _, a := range rest {
+	for i := 0; i < len(rest); i++ {
+		a := rest[i]
 		if a == "-v" || a == "--verbose" {
 			verbose = true
 		}
 		if a == "--once" {
 			*flagWatchOnce = true
+		}
+		if a == "--autorotate" && i+1 < len(rest) {
+			if n, err := strconv.Atoi(rest[i+1]); err == nil {
+				*flagAutorotate = n
+			}
+			i++
+		} else if strings.HasPrefix(a, "--autorotate=") {
+			if n, err := strconv.Atoi(strings.TrimPrefix(a, "--autorotate=")); err == nil {
+				*flagAutorotate = n
+			}
 		}
 	}
 
@@ -143,6 +156,10 @@ func loadConfig() (config.Config, error) {
 		cfg.WatchdogSeconds = *flagWatchInt
 		cfg.WatchdogInterval = time.Duration(*flagWatchInt) * time.Second
 	}
+	if *flagAutorotate > 0 {
+		cfg.AutorotateSeconds = *flagAutorotate
+		cfg.AutorotateInterval = time.Duration(*flagAutorotate) * time.Second
+	}
 	if *flagTorBin != "" {
 		cfg.TorBinary = *flagTorBin
 	}
@@ -174,14 +191,14 @@ func printUsage() {
 	fmt.Println("  rotate    New Tor identity via ControlPort NEWNYM")
 	fmt.Println("  doctor [-v]  Health checks (verbose with -v)")
 	fmt.Println("  env [--write] [--json] [--shell bash|fish]  Print/write proxy env (XDG)")
-	fmt.Println("  watchdog [--once]  Keep services alive (Ctrl-C to stop)")
+	fmt.Println("  watchdog [--once] [--autorotate SECS]  Alive + optional NEWNYM loop (Ctrl-C stops)")
 	fmt.Println("  help      Show this help")
 	fmt.Println("Global flags:")
 	flag.PrintDefaults()
 	fmt.Println("Env overrides: TORSTACK_TOR_BINARY, TORSTACK_PRIVOXY_BINARY,")
 	fmt.Println("  TORSTACK_TOR_CONFIG, TORSTACK_PRIVOXY_CONFIG, TORSTACK_LOG_DIR,")
 	fmt.Println("  TORSTACK_SOCKS_ADDR, TORSTACK_PRIVOXY_ADDR, TORSTACK_CONTROL_ADDR,")
-	fmt.Println("  TORSTACK_CONTROL_PASSWORD, TORSTACK_WATCH_INTERVAL, TORSTACK_DEBUG=1")
+	fmt.Println("  TORSTACK_CONTROL_PASSWORD, TORSTACK_WATCH_INTERVAL, TORSTACK_AUTOROTATE, TORSTACK_DEBUG=1")
 }
 
 func startStack(cfg config.Config) error {
