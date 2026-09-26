@@ -1,0 +1,20 @@
+{
+  "name": "torstack",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Lint/format tooling untuk file JS torstack (sisanya shell).",
+  "scripts": {
+    "lint": "bash tools/biome lint .",
+    "lint:fix": "bash tools/biome lint --write .",
+    "fmt": "bash tools/biome format --write .",
+    "check": "bash tools/biome check .",
+    "check:all": "bash tools/biome check . && bash tools/biome check --stdin-file-path=bin/tor-dashboard.ts < bin/tor-dashboard > /dev/null",
+    "fmt:dashboard": "bash tools/biome format --stdin-file-path=bin/tor-dashboard.ts --write < bin/tor-dashboard > bin/tor-dashboard.new && mv bin/tor-dashboard.new bin/tor-dashboard",
+    "fix": "bash tools/biome check --write .",
+    "test": "bash tools/lint-shell.sh && bash tools/biome ci ."
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.14"
+  }
+}

@@ -1,0 +1,282 @@
+#!/usr/bin/env bun
+// tor-dashboard — web UI localhost, EVENT-DRIVEN (SSE murni).
+// Sumber kebenaran = state/events.jsonl (diisi bin/* via lib/events.sh + bin/tor-events).
+// Browser terima push <1s, tanpa polling /api/status berulang.
+// `bun bin/tor-dashboard [--port 8899] [--host 127.0.0.1]` | `torstack web`
+import path from "node:path";
+import fs from "node:fs";
+import { PAGE as HTML } from "../lib/dashboard-page.ts";
+
+const scriptDir = import.meta.dir;
+const ROOT = process.env.TORSTACK_ROOT ?? path.resolve(scriptDir, "..");
+let PORT = Number(process.env.PORT ?? 8899);
+let HOST = process.env.HOST ?? "127.0.0.1";
+for (let i = 2; i < process.argv.length; i++) {
+  if (process.argv[i] === "--port") PORT = Number(process.argv[i + 1] ?? PORT);
+  if (process.argv[i] === "--host") HOST = String(process.argv[i + 1] ?? HOST);
+}
+
+const HOOK_FILE = path.join(ROOT, "hooks", "post-rotate.mjs");
+const CONF_FILE = path.join(ROOT, "state", "autorotate.conf");
+const AUTO_PID = path.join(ROOT, "state", "autorotate.pid");
+const TOR_PID = path.join(ROOT, "state", "tor.pid");
+const PRIV_PID = path.join(ROOT, "state", "privoxy.pid");
+const EV_PID = path.join(ROOT, "state", "tor-events.pid");
+const LAST_ROTATE = path.join(ROOT, "state", "last-rotate");
+const TOR_LOG = path.join(ROOT, "logs", "tor.log");
+const AUTO_LOG = path.join(ROOT, "logs", "autorotate.log");
+const IP_HIST = path.join(ROOT, "state", "ip-history.json");
+const EVENTS = path.join(ROOT, "state", "events.jsonl");
+// runtime shim: panggil bin/* via bash eksplisit (jangan andalkan shebang)
+const SHELL = process.env.TORSTACK_BASH ?? "bash";
+
+async function sh(cmd: string[]): Promise<{ ok: boolean; out: string }> {
+  try {
+    const p = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
+    const [so, se, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+    return { ok: code === 0, out: (so + se).slice(0, 4000) };
+  } catch (e: any) {
+    return { ok: false, out: String(e?.message ?? e) };
+  }
+}
+const alive = async (pidFile: string) => {
+  try {
+    const pid = (await Bun.file(pidFile).text()).trim();
+    if (!pid) return false;
+    const p = Bun.spawn(["kill", "-0", pid], { stdout: "ignore", stderr: "ignore" });
+    return (await p.exited) === 0;
+  } catch { return false; }
+};
+const readConf = async () => {
+  try {
+    const t = await Bun.file(CONF_FILE).text();
+    const m: Record<string, string> = {};
+    for (const line of t.split("\n")) {
+      const [k, ...v] = line.split("=");
+      if (k) m[k.trim()] = v.join("=").trim();
+    }
+    return { interval: Number(m.INTERVAL ?? 60), hookFile: m.HOOK_FILE ?? HOOK_FILE };
+  } catch { return { interval: 60, hookFile: HOOK_FILE }; }
+};
+
+// --- state turunan event (bukan polling) ---
+let ipCache = { ip: "", at: 0 };
+let ipHistory: { ip: string; at: number }[] = [];
+try { ipHistory = await Bun.file(IP_HIST).json().catch(() => []); } catch { ipHistory = []; }
+if (!Array.isArray(ipHistory)) ipHistory = [];
+let bw = { down: 0, up: 0, at: 0 };
+let bootstrap = { progress: -1, at: 0 };
+let circ = { built: 0, failed: 0, last: "", at: 0 };
+let lastRotateMs = 0;
+try {
+  const t = (await Bun.file(LAST_ROTATE).text()).trim();
+  const n = Number(t || 0);
+  lastRotateMs = n > 1e12 ? n : n > 0 ? n * 1000 : 0;
+} catch {}
+
+function appendEvent(type: string, data: unknown, source = "dashboard") {
+  try {
+    const line = JSON.stringify({ ts: Date.now(), type, source, data });
+    fs.appendFileSync(EVENTS, line + "\n");
+  } catch {}
+}
+
+function applyEvent(ev: any) {
+  try {
+    const t = ev?.type, d = ev?.data ?? {}, ts = Number(ev?.ts || Date.now());
+    if (t === "net.ip_changed" && d.ip) {
+      if (d.ip !== ipCache.ip) {
+        ipCache = { ip: String(d.ip), at: ts };
+        ipHistory.unshift({ ip: String(d.ip), at: ts });
+        ipHistory = ipHistory.slice(0, 20);
+        Bun.write(IP_HIST, JSON.stringify(ipHistory)).catch(() => {});
+      } else ipCache.at = ts;
+    } else if (t === "rotate.ok") {
+      lastRotateMs = ts;
+      if (d.new && d.new !== ipCache.ip) {
+        ipCache = { ip: String(d.new), at: ts };
+        ipHistory.unshift({ ip: String(d.new), at: ts });
+        ipHistory = ipHistory.slice(0, 20);
+        Bun.write(IP_HIST, JSON.stringify(ipHistory)).catch(() => {});
+      }
+    } else if (t === "tor.bootstrap") {
+      bootstrap = { progress: Number(d.progress ?? -1), at: ts };
+    } else if (t === "net.bw") {
+      bw = { down: Number(d.down || 0), up: Number(d.up || 0), at: ts };
+    } else if (t === "tor.circ") {
+      if (d.status === "BUILT") circ.built++;
+      if (d.status === "FAILED") circ.failed++;
+      circ.last = String(d.raw || d.status || "").slice(0, 120); circ.at = ts;
+    }
+  } catch {}
+}
+
+async function snapshot() {
+  const [tor, priv, auto, evRun, conf] = await Promise.all([alive(TOR_PID), alive(PRIV_PID), alive(AUTO_PID), alive(EV_PID), readConf()]);
+  let last = lastRotateMs;
+  try {
+    const t = (await Bun.file(LAST_ROTATE).text()).trim();
+    const n = Number(t || 0);
+    if (n > 0) last = n > 1e12 ? n : n * 1000;
+  } catch {}
+  const nextIn = auto && last ? Math.max(0, Math.round((last + conf.interval * 1000 - Date.now()) / 1000)) : auto ? conf.interval : -1;
+  return { tor, priv, auto, evRun, ip: ipCache.ip, ipAt: ipCache.at, history: ipHistory.slice(0, 10),
+    bw, bootstrap, circ, lastRotate: last, nextIn, interval: conf.interval, now: Date.now() };
+}
+
+// --- SSE broadcast ---
+const clients = new Set<ReadableStreamDefaultController>();
+const enc = new TextEncoder();
+function broadcast(obj: unknown) {
+  const chunk = enc.encode(`data: ${JSON.stringify(obj)}\n\n`);
+  for (const c of [...clients]) {
+    try { c.enqueue(chunk); } catch { try { c.close(); } catch {} clients.delete(c); }
+  }
+}
+
+// --- tail events.jsonl (push on new line, cek 500ms — client tetap murni push) ---
+let evOffset = 0;
+try { evOffset = fs.statSync(EVENTS).size; } catch { evOffset = 0; }
+let evFd: number | null = null;
+function pollEvents() {
+  try {
+    let size = 0;
+    try { size = fs.statSync(EVENTS).size; } catch { return; }
+    if (size < evOffset) evOffset = 0; // trimmed / rotated
+    if (size === evOffset) return;
+    if (evFd === null) { try { evFd = fs.openSync(EVENTS, "r"); } catch { return; } }
+    const len = size - evOffset;
+    if (len <= 0 || len > 4_194_304) { evOffset = size; return; } // guard
+    const buf = Buffer.alloc(len);
+    fs.readSync(evFd, buf, 0, len, evOffset);
+    evOffset = size;
+    for (const line of buf.toString("utf8").split("\n")) {
+      const s = line.trim();
+      if (!s) continue;
+      try {
+        const ev = JSON.parse(s);
+        applyEvent(ev);
+        broadcast({ kind: "event", event: ev });
+      } catch {}
+    }
+  } catch {}
+}
+setInterval(pollEvents, 500);
+
+// --- watcher status proses: hanya push saat BERUBAH (bukan polling UI) ---
+let lastProc = "";
+setInterval(async () => {
+  const [tor, priv, auto, evRun] = await Promise.all([alive(TOR_PID), alive(PRIV_PID), alive(AUTO_PID), alive(EV_PID)]);
+  const key = `${tor?1:0}${priv?1:0}${auto?1:0}${evRun?1:0}`;
+  if (key !== lastProc) {
+    lastProc = key;
+    broadcast({ kind: "event", event: { ts: Date.now(), type: "proc.status", source: "dashboard", data: { tor, priv, auto, evRun } } });
+  }
+}, 5000);
+
+// replay: replay terakhir untuk klien baru / refresh
+function readTail(n = 50): any[] {
+  try {
+    const t = fs.readFileSync(EVENTS, "utf8");
+    const lines = t.split("\n").filter((l) => l.trim());
+    return lines.slice(-n).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
+
+
+Bun.serve({
+  port: PORT,
+  hostname: HOST,
+  async fetch(req) {
+    const url = new URL(req.url);
+    const json = (o: unknown, s = 200) => new Response(JSON.stringify(o), { status: s, headers: { "content-type": "application/json" } });
+
+    if (url.pathname === "/") return new Response(HTML, { headers: { "content-type": "text/html" } });
+    if (url.pathname === "/api/status") return json(await snapshot());
+    if (url.pathname === "/api/history") {
+      const tail = Math.min(500, Math.max(1, Number(url.searchParams.get("tail") ?? 50)));
+      return json({ events: readTail(tail) });
+    }
+
+    // --- SSE MURNI: snapshot sekali + push tiap event baru ---
+    if (url.pathname === "/api/events") {
+      let hb: Timer | undefined;
+      const stream = new ReadableStream({
+        async start(controller) {
+          clients.add(controller as unknown as ReadableStreamDefaultController);
+          try {
+            const s = await snapshot();
+            controller.enqueue(enc.encode(`data: ${JSON.stringify({ kind: "snapshot", snapshot: s })}\n\n`));
+          } catch {}
+          hb = setInterval(() => {
+            try { controller.enqueue(enc.encode(`: ping ${Date.now()}\n\n`)); } catch {}
+          }, 15000);
+        },
+        cancel() {
+          if (hb) clearInterval(hb);
+          for (const c of [...clients]) {
+            try { (c as any).close?.(); } catch {}
+          }
+          // hapus controller yang cancel — cocokkan via closure tidak tersedia,
+          // jadi bersihkan yang error saat broadcast berikutnya
+        },
+      });
+      return new Response(stream, { headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" } });
+    }
+
+    if (url.pathname === "/api/rotate" && req.method === "POST") {
+      appendEvent("rotate.invoked", {}, "dashboard");
+      const r = await sh([SHELL, path.join(ROOT, "bin", "tor-rotate")]);
+      // tor-rotate sudah emit rotate.pre/ok + net.ip_changed sendiri;
+      // tailer akan push dalam <1s. Respon ini hanya konfirmasi HTTP.
+      return json({ ok: r.ok, note: r.out.slice(0, 500) });
+    }
+
+    if (url.pathname === "/api/config" && req.method === "GET") {
+      const conf = await readConf();
+      let hookCode = "";
+      try { hookCode = await Bun.file(HOOK_FILE).text(); } catch {}
+      return json({ interval: conf.interval, hookCode });
+    }
+
+    if (url.pathname === "/api/config" && req.method === "POST") {
+      const body = (await req.json().catch(() => ({}))) as { interval?: number; hookCode?: string };
+      const interval = Math.max(10, Number(body.interval ?? 60));
+      if (typeof body.hookCode === "string") {
+        const tmp = path.join(ROOT, "state", ".hook-check.mjs");
+        await Bun.write(tmp, body.hookCode);
+        const chk = await sh(["bun", "build", tmp, "--target", "bun"]);
+        if (!chk.ok) return json({ ok: false, error: "Sintaks JS tidak valid", detail: chk.out.slice(0, 1000) }, 400);
+        await Bun.write(HOOK_FILE, body.hookCode.endsWith("\n") ? body.hookCode : body.hookCode + "\n");
+      }
+      await Bun.write(CONF_FILE, `INTERVAL=${interval}\nHOOK_FILE=${HOOK_FILE}\n`);
+      appendEvent("autorotate.config", { interval }, "dashboard");
+      return json({ ok: true, interval, saved: HOOK_FILE });
+    }
+
+    if (url.pathname === "/api/autorotate/start" && req.method === "POST") {
+      const body = (await req.json().catch(() => ({}))) as { interval?: number };
+      const conf = await readConf();
+      const interval = Math.max(10, Number(body.interval ?? conf.interval));
+      const r = await sh([SHELL, path.join(ROOT, "bin", "tor-autorotate"), "start", "--interval", String(interval)]);
+      return json({ ok: r.ok, note: r.out });
+    }
+
+    if (url.pathname === "/api/autorotate/stop" && req.method === "POST") {
+      const r = await sh([SHELL, path.join(ROOT, "bin", "tor-autorotate"), "stop"]);
+      return json({ ok: r.ok, note: r.out });
+    }
+
+    if (url.pathname === "/api/logs") {
+      const which = url.searchParams.get("which") === "tor" ? TOR_LOG : AUTO_LOG;
+      try {
+        const t = await Bun.file(which).text();
+        return json({ logs: t.split("\n").slice(-80).join("\n") });
+      } catch { return json({ logs: "(log kosong / tor belum jalan)" }); }
+    }
+
+    return json({ error: "not found" }, 404);
+  },
+});
+
+console.log(`[dashboard] EVENT-DRIVEN http://${HOST}:${PORT}  (bus=${EVENTS})`);

@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# versi rilis — sinkron dengan package.json + git tag vX.Y.Z
+VERSION="0.2.0"
+# ROOT: ikuti symlink (hasil install = symlink ke $INSTALL_DIR/bin),
+# bisa di-override via env TORSTACK_ROOT untuk layout custom.
+_src="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+  _rl="$(readlink -f "$_src" 2>/dev/null || true)"
+  [ -n "${_rl:-}" ] && _src="$_rl"
+fi
+ROOT="${TORSTACK_ROOT:-$(cd "$(dirname "$_src")/.." && pwd)}"
+CONF_TOR="$ROOT/conf/torrc"
+CONF_PRIVOXY="$ROOT/conf/privoxy.conf"
+CONF_TOR_EX="$ROOT/conf/torrc.example"
+CONF_PRIVOXY_EX="$ROOT/conf/privoxy.conf.example"
+PID_TOR="$ROOT/state/tor.pid"
+PID_PRIVOXY="$ROOT/state/privoxy.pid"
+PID_EVENTS="$ROOT/state/tor-events.pid"
+LOG_TOR="$ROOT/logs/tor.log"
+LOG_PRIVOXY="$ROOT/logs/privoxy.log"
+LOG_EVENTS="$ROOT/logs/tor-events.log"
+LAST_ROTATE="$ROOT/state/last-rotate"
+SOCKS="127.0.0.1:9050"
+HTTP_P="127.0.0.1:8118"
+
+# event bus (best effort — dashboard realtime baca dari sini)
+if [ -f "$ROOT/lib/events.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$ROOT/lib/events.sh" 2>/dev/null || true
+fi
+command -v emit >/dev/null 2>&1 || emit() { :; }
+# runtime shim — panggilan antar-script via bash eksplisit (abaikan shebang)
+if [ -f "$ROOT/lib/shim.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$ROOT/lib/shim.sh" 2>/dev/null || true
+fi
+: "${TORSTACK_BASH:=bash}"
+command -v run_script >/dev/null 2>&1 || run_script() { exec bash "$@"; }
+
+log() { printf '[torstack] %s\n' "$*"; }
+err() { printf '[torstack][err] %s\n' "$*" >&2; }
+
+is_alive() { [ -f "$1" ] && kill -0 "$(cat "$1" 2>/dev/null)" 2>/dev/null; }
+
+# render conf generated dari *.example — portable antar mesin.
+# torrc pakai absolute path (wajib tor), tapi selalu di-regenerate dari $ROOT
+# saat start, jadi hasil clone di mesin lain tetap benar.
+render_conf() {
+  mkdir -p "$ROOT/conf" "$ROOT/logs" "$ROOT/state/tor-data"
+  if [ -f "$CONF_TOR_EX" ]; then
+    tmp="$(cat "$CONF_TOR_EX")"
+    tmp="${tmp//\{\{ROOT\}\}/$ROOT}"
+    printf '%s\n' "$tmp" > "$CONF_TOR"
+  else
+    err "template hilang: $CONF_TOR_EX (pakai conf existing)"
+  fi
+  # deteksi confdir privoxy system (untuk actions/templates). Opsional.
+  confdir=""
+  if [ -n "${PREFIX:-}" ] && [ -d "$PREFIX/etc/privoxy" ]; then
+    confdir="$PREFIX/etc/privoxy"
+  else
+    for d in /etc/privoxy /usr/share/privoxy /usr/local/etc/privoxy; do
+      if [ -d "$d" ]; then confdir="$d"; break; fi
+    done
+  fi
+  if [ -f "$CONF_PRIVOXY_EX" ]; then
+    tmp="$(cat "$CONF_PRIVOXY_EX")"
+    tmp="${tmp//\{\{ROOT\}\}/$ROOT}"
+    # placeholder ada di baris sendiri -> ganti polos, tanpa newline magic
+    if [ -n "$confdir" ]; then
+      tmp="${tmp//\{\{CONFDIR_LINE\}\}/confdir $confdir}"
+    else
+      tmp="${tmp//\{\{CONFDIR_LINE\}\}/}"
+    fi
+    printf '%s\n' "$tmp" > "$CONF_PRIVOXY"
+  else
+    err "template hilang: $CONF_PRIVOXY_EX (pakai conf existing)"
+  fi
+}
+
+cmd_start() {
+  mkdir -p "$ROOT/logs" "$ROOT/state" "$ROOT/state/tor-data"
+  render_conf
+  emit torstack.start '{"msg":"start requested"}' torstack
+  if is_alive "$PID_TOR"; then log "tor already running (pid $(cat "$PID_TOR"))"; else
+    log "starting tor..."
+    rm -f "$LOG_TOR"
+    # shellcheck disable=SC2094
+    nohup tor -f "$CONF_TOR" > "$LOG_TOR" 2>&1 &
+    echo $! > "$PID_TOR"
+    log "tor pid $! — waiting bootstrap 100%..."
+    for _ in $(seq 1 60); do
+      grep -q "Bootstrapped 100%" "$LOG_TOR" 2>/dev/null && break
+      sleep 1
+    done
+    if grep -q "Bootstrapped 100%" "$LOG_TOR" 2>/dev/null; then
+      log "tor bootstrapped."
+      cur_ip="$(curl -s --max-time 10 --socks5-hostname "$SOCKS" https://api.ipify.org 2>/dev/null || true)"
+      emit tor.bootstrap '{"progress":100}' tor; [ -n "$cur_ip" ] && emit net.ip_changed "{\"ip\":\"$cur_ip\"}" tor || true
+    else
+      err "tor belum 100% setelah 60s, cek $LOG_TOR"; tail -n 20 "$LOG_TOR"
+      emit tor.bootstrap_fail '{"progress":0}' tor
+    fi
+  fi
+  if pgrep -x privoxy >/dev/null; then log "privoxy already running (pid $(pgrep -x privoxy))"; else
+    log "starting privoxy..."
+    rm -f "$LOG_PRIVOXY"
+    nohup privoxy "$CONF_PRIVOXY" > "$LOG_PRIVOXY" 2>&1 &
+    echo $! > "$PID_PRIVOXY"
+    sleep 1
+    if pgrep -x privoxy >/dev/null; then
+      log "privoxy running (pid $(pgrep -x privoxy))"
+      emit privoxy.start '{"ok":true}' torstack
+    else
+      err "privoxy gagal start"; tail -n 20 "$LOG_PRIVOXY"
+      emit privoxy.fail '{"ok":false}' torstack
+    fi
+  fi
+  # event listener tor ControlPort (CIRC/STREAM/BW) — best effort, via shim
+  if [ -x "$ROOT/bin/tor-events" ]; then
+    if [ -f "$PID_EVENTS" ] && kill -0 "$(cat "$PID_EVENTS" 2>/dev/null)" 2>/dev/null; then
+      : # sudah jalan
+    else
+      nohup "$TORSTACK_BASH" "$ROOT/bin/tor-events" start >/dev/null 2>&1 || true
+    fi
+  fi
+  log "done."
+  echo
+  echo "→ Copy paste ini:"
+  echo "  export HTTP_PROXY=\"http://127.0.0.1:8118\""
+  echo "  export HTTPS_PROXY=\"http://127.0.0.1:8118\""
+  echo "  export NO_PROXY=\"localhost,127.0.0.1,::1\""
+  echo
+}
+
+cmd_stop() {
+  emit torstack.stop '{"msg":"stop requested"}' torstack
+  if [ -x "$ROOT/bin/tor-events" ]; then "$TORSTACK_BASH" "$ROOT/bin/tor-events" stop >/dev/null 2>&1 || true; fi
+  rm -f "$PID_EVENTS"
+  for f in "$PID_PRIVOXY" "$PID_TOR"; do
+    if [ -f "$f" ]; then
+      pid="$(cat "$f" 2>/dev/null || true)"
+      if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null && log "killed $pid"; sleep 1; kill -9 "$pid" 2>/dev/null || true; fi
+      rm -f "$f"
+    fi
+  done
+  pkill -x tor 2>/dev/null || true
+  pkill -x privoxy 2>/dev/null || true
+  log "stopped."
+}
+
+cmd_status() {
+  echo "== torstack status =="
+  echo "root : $ROOT"
+  if is_alive "$PID_TOR"; then echo "tor  : RUN pid=$(cat "$PID_TOR")"; else echo "tor  : STOP"; fi
+  if is_alive "$PID_PRIVOXY"; then echo "privoxy: RUN pid=$(cat "$PID_PRIVOXY")"; elif pgrep -x privoxy >/dev/null; then echo "privoxy: RUN pid=$(pgrep -x privoxy) (pid file stale)"; else echo "privoxy: STOP"; fi
+  if [ -f "$LAST_ROTATE" ]; then echo "last-rotate: $(cat "$LAST_ROTATE")"; else echo "last-rotate: -"; fi
+  echo "-- socks5 ${SOCKS} --"
+  curl -s --max-time 10 --socks5-hostname "$SOCKS" https://api.ipify.org 2>&1 | head -c 100 || true; echo
+  echo "-- http ${HTTP_P} --"
+  curl -s --max-time 10 -x "http://$HTTP_P" https://api.ipify.org 2>&1 | head -c 100 || true; echo
+}
+
+cmd_rotate() { run_script "$ROOT/bin/tor-rotate" "$@"; }
+cmd_logs() {
+  # torstack logs [n] | torstack logs events [n]
+  if [ "${1:-}" = "events" ]; then shift || true; tail -n "${1:-50}" "$LOG_EVENTS"; return; fi
+  tail -n "${1:-50}" "$LOG_TOR"
+}
+cmd_autorotate() { run_script "$ROOT/bin/tor-autorotate" "$@"; }
+cmd_web() {
+  # torstack web [--port N] [--host ADDR] [--no-open]
+  local port=8899 host="127.0.0.1" open=1
+  local args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --port) port="${2:-8899}"; args+=("$1" "$2"); shift 2 ;;
+      --host) host="${2:-127.0.0.1}"; args+=("$1" "$2"); shift 2 ;;
+      --no-open) open=0; shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  if [ "$open" -eq 1 ] && command -v termux-open-url >/dev/null 2>&1; then
+    # buka browser 2 detik setelah server naik (detached — selamat dari exec)
+    ( sleep 2; termux-open-url "http://$host:$port" >/dev/null 2>&1 & ) >/dev/null 2>&1 &
+  fi
+  echo "[torstack] webui -> http://$host:$port (jangan tutup sesi ini)"
+  exec bun "$ROOT/bin/tor-dashboard" "${args[@]}"
+}
+cmd_events() {
+  # torstack events [n] [--follow] [--type TYPE]
+  local n=50 follow=0 type=""
+  for a in "$@"; do
+    case "$a" in
+      --follow|-f) follow=1 ;;
+      --type=*) type="${a#--type=}" ;;
+      [0-9]*) n="$a" ;;
+    esac
+  done
+  local f="$ROOT/state/events.jsonl"
+  [ -f "$f" ] || { echo "(belum ada event)"; return 0; }
+  if [ -n "$type" ]; then
+    if [ "$follow" -eq 1 ]; then tail -F -n "$n" "$f" | grep --line-buffered "\"type\":\"$type\""; else grep "\"type\":\"$type\"" "$f" | tail -n "$n"; fi
+  else
+    if [ "$follow" -eq 1 ]; then tail -F -n "$n" "$f"; else tail -n "$n" "$f"; fi
+  fi
+}
+
+case "${1:-help}" in
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  restart) cmd_stop; sleep 1; cmd_start ;;
+  status) cmd_status ;;
+  rotate) shift; cmd_rotate "$@" ;;
+  logs) shift || true; cmd_logs "$@" ;;
+  autorotate) shift || true; cmd_autorotate "$@" ;;
+  web) shift || true; cmd_web "$@" ;;
+  events) shift || true; cmd_events "$@" ;;
+  version|--version|-v) echo "torstack $VERSION" ;;
+  *) echo "usage: torstack {start|stop|restart|status|rotate|logs [n]|autorotate ...|web [--port N] [--host ADDR] [--no-open]|events [n] [--follow] [--type TYPE]|version}"; exit 1 ;;
+esac

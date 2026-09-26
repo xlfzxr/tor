@@ -1,0 +1,10 @@
+# torstack privoxy.conf — GENERATED, jangan edit manual!
+# sumber: conf/privoxy.conf.example — di-render otomatis oleh `bin/torstack start`
+# atau `bun bootstrap.mjs`. Placeholder ROOT dan CONFDIR_LINE diganti otomatis.
+# CONFDIR_LINE menempati barisnya sendiri: bila confdir system tidak
+# ditemukan ia jadi baris kosong (aman untuk privoxy).
+{{CONFDIR_LINE}}
+listen-address 127.0.0.1:8118
+forward-socks5t / 127.0.0.1:9050 .
+logfile {{ROOT}}/logs/privoxy.log
+debug 1

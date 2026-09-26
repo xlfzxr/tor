@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# tor-autorotate — scheduler ganti IP otomatis + JS hook runner.
+# usage:
+#   tor-autorotate start [--interval 60] [--hook hooks/post-rotate.mjs]
+#   tor-autorotate stop | status | run-once
+# env: INTERVAL=60 HOOK_FILE=hooks/post-rotate.mjs PRE_HOOK=hooks/pre-rotate.mjs
+set -u
+_src="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+  _rl="$(readlink -f "$_src" 2>/dev/null || true)"
+  [ -n "${_rl:-}" ] && _src="$_rl"
+fi
+ROOT="${TORSTACK_ROOT:-$(cd "$(dirname "$_src")/.." && pwd)}"
+PID_FILE="$ROOT/state/autorotate.pid"
+CONF_FILE="$ROOT/state/autorotate.conf"
+LOG="$ROOT/logs/autorotate.log"
+HOOK_DEFAULT="$ROOT/hooks/post-rotate.mjs"
+PRE_DEFAULT="$ROOT/hooks/pre-rotate.mjs"
+
+INTERVAL="${INTERVAL:-60}"
+HOOK_FILE="${HOOK_FILE:-$HOOK_DEFAULT}"
+mkdir -p "$ROOT/state" "$ROOT/logs" "$ROOT/hooks"
+
+# event bus (best effort)
+if [ -f "$ROOT/lib/events.sh" ]; then . "$ROOT/lib/events.sh" 2>/dev/null || true; fi
+command -v emit >/dev/null 2>&1 || emit() { :; }
+# runtime shim (abaikan shebang saat panggil bin lain)
+if [ -f "$ROOT/lib/shim.sh" ]; then . "$ROOT/lib/shim.sh" 2>/dev/null || true; fi
+: "${TORSTACK_BASH:=bash}"
+
+log() { printf '%s [autorotate] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG"; }
+alive() { [ -f "$1" ] && kill -0 "$(cat "$1" 2>/dev/null)" 2>/dev/null; }
+current_ip() { curl -s --max-time 15 --socks5-hostname 127.0.0.1:9050 https://api.ipify.org 2>/dev/null || echo ""; }
+
+run_hook() {
+  # $1 = hook file, sisanya env sudah di-export (OLD_IP NEW_IP TIMESTAMP)
+  local hook="$1"
+  [ -f "$hook" ] || return 0
+  if command -v bun >/dev/null 2>&1; then
+    bun "$hook" >>"$LOG" 2>&1 || log "WARN hook gagal: $hook"
+  elif command -v node >/dev/null 2>&1; then
+    node "$hook" >>"$LOG" 2>&1 || log "WARN hook gagal: $hook"
+  else
+    log "WARN bun/node tidak ada — hook dilewati"
+  fi
+}
+
+do_rotate_once() {
+  local oldIP newIP ts
+  oldIP="$(current_ip)"
+  OLD_IP="$oldIP"
+  TIMESTAMP="$(date +%s)"
+  export OLD_IP TIMESTAMP
+  if [ -f "${PRE_HOOK:-$PRE_DEFAULT}" ]; then
+    export TIMESTAMP
+    if ! run_hook "${PRE_HOOK:-$PRE_DEFAULT}"; then
+      log "pre-hook gagal — rotate dibatalkan"; return 1
+    fi
+  fi
+  if "$TORSTACK_BASH" "$ROOT/bin/tor-rotate" >>"$LOG" 2>&1; then
+    sleep 2
+    newIP="$(current_ip)"
+    export NEW_IP="$newIP"
+    log "rotate OK ${OLD_IP:-?} -> ${NEW_IP:-?}"
+    emit autorotate.ok "{\"old\":\"${OLD_IP:-}\",\"new\":\"${NEW_IP:-}\"}" tor-autorotate
+    run_hook "${HOOK_FILE:-$HOOK_DEFAULT}"
+    return 0
+  else
+    log "rotate GAGAL"; emit autorotate.fail '{"reason":"rotate-failed"}' tor-autorotate; return 1
+  fi
+}
+
+loop() {
+  log "autorotate loop start interval=${INTERVAL}s hook=${HOOK_FILE}"
+  while true; do
+    sleep "$INTERVAL"
+    do_rotate_once || true
+  done
+}
+
+cmd_start() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --interval) INTERVAL="${2:-60}"; shift 2 ;;
+      --hook) HOOK_FILE="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  printf 'INTERVAL=%s\nHOOK_FILE=%s\n' "$INTERVAL" "$HOOK_FILE" > "$CONF_FILE"
+  if alive "$PID_FILE"; then echo "autorotate already running pid=$(cat "$PID_FILE")"; exit 0; fi
+  # shellcheck disable=SC2094
+  # stdout loop dibuang (log() sudah tee ke file), stderr tetap ke file
+  INTERVAL="$INTERVAL" HOOK_FILE="$HOOK_FILE" nohup bash "$_src" _loop >/dev/null 2>>"$LOG" &
+  echo $! > "$PID_FILE"
+  echo "autorotate started pid=$! interval=${INTERVAL}s"
+  emit autorotate.start "{\"interval\":$INTERVAL}" tor-autorotate
+}
+
+cmd_stop() {
+  if [ -f "$PID_FILE" ]; then
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null || true
+    rm -f "$PID_FILE"
+  fi
+  pkill -f "tor-autorotate _loop" 2>/dev/null || true
+  emit autorotate.stop '{}' tor-autorotate
+  echo "autorotate stopped."
+}
+
+cmd_status() {
+  if [ -f "$CONF_FILE" ]; then echo "-- conf: $(cat "$CONF_FILE" | tr '\n' ' ')"; fi
+  if alive "$PID_FILE"; then echo "autorotate: RUN pid=$(cat "$PID_FILE")"; else echo "autorotate: STOP"; fi
+  echo -n "current IP: "; current_ip; echo
+}
+
+case "${1:-status}" in
+  _loop)
+    # shellcheck disable=SC1090 # conf runtime (ditulis cmd_start), bukan konstanta
+    [ -f "$CONF_FILE" ] && . "$CONF_FILE"
+    loop ;;
+  start) shift; cmd_start "$@" ;;
+  stop) cmd_stop ;;
+  status) cmd_status ;;
+  run-once)
+    # shellcheck disable=SC1090 # conf runtime (ditulis cmd_start), bukan konstanta
+    [ -f "$CONF_FILE" ] && . "$CONF_FILE"
+    do_rotate_once ;;
+  *) echo "usage: tor-autorotate {start [--interval N] [--hook FILE]|stop|status|run-once}"; exit 1 ;;
+esac

@@ -1,0 +1,15 @@
+# torstack torrc — GENERATED, jangan edit manual!
+# sumber: conf/torrc.example — di-render otomatis oleh `bin/torstack start`
+# atau `bun bootstrap.mjs`. Placeholder ROOT diganti dengan path repo.
+SocksPort 127.0.0.1:9050
+ControlPort 127.0.0.1:9051
+CookieAuthentication 1
+CookieAuthFile {{ROOT}}/state/tor-data/control_auth_cookie
+DataDirectory {{ROOT}}/state/tor-data
+Log notice file {{ROOT}}/logs/tor.log
+RunAsDaemon 0
+AvoidDiskWrites 1
+CircuitBuildTimeout 10
+LearnCircuitBuildTimeout 0
+MaxCircuitDirtiness 300
+NewCircuitPeriod 15

@@ -1,0 +1,13 @@
+{
+  "tor_binary": "tor",
+  "privoxy_binary": "privoxy",
+  "tor_config": "",
+  "privoxy_config": "",
+  "log_dir": "",
+  "watchdog_interval_seconds": 15,
+  "tor_socks_addr": "127.0.0.1:9050",
+  "privoxy_addr": "127.0.0.1:8118",
+  "tor_control_addr": "127.0.0.1:9051",
+  "tor_control_password": "",
+  "debug": false
+}

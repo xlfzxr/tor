@@ -1,0 +1,32 @@
+# runtime — jangan commit
+state/
+logs/
+*.log
+*.pid
+*.bak
+*.tmp
+
+# tor data (secrets + cache)
+/state/tor-data/
+
+# generated runtime conf (di-render dari *.example via bootstrap/torstack start)
+conf/torrc
+conf/privoxy.conf
+
+# JS tooling (biome via npm, Termux lapor platform=android jadi
+# node_modules tidak portable antar mesin — install lokal via `bun install`)
+node_modules/
+bun.lock
+
+# python cache
+__pycache__/
+*.pyc
+
+# OS / editor
+.DS_Store
+*.swp
+*~
+
+# Go build artifacts
+/torstack
+/dist/

@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# tor-watchdog — jaga Tor + Privoxy hidup. Jalankan via cron / termux-job / nohup loop.
+set -u
+_src="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+  _rl="$(readlink -f "$_src" 2>/dev/null || true)"
+  [ -n "${_rl:-}" ] && _src="$_rl"
+fi
+ROOT="${TORSTACK_ROOT:-$(cd "$(dirname "$_src")/.." && pwd)}"
+PID_TOR="$ROOT/state/tor.pid"
+PID_PRIVOXY="$ROOT/state/privoxy.pid"
+LOG="$ROOT/logs/watchdog.log"
+INTERVAL="${INTERVAL:-15}"
+LIB="$ROOT/lib/health.sh"
+
+# shellcheck disable=SC1090 # path runtime ($ROOT/lib/health.sh), bukan konstanta
+[ -f "$LIB" ] && . "$LIB" || true
+if [ -f "$ROOT/lib/events.sh" ]; then . "$ROOT/lib/events.sh" 2>/dev/null || true; fi
+command -v emit >/dev/null 2>&1 || emit() { :; }
+if [ -f "$ROOT/lib/shim.sh" ]; then . "$ROOT/lib/shim.sh" 2>/dev/null || true; fi
+: "${TORSTACK_BASH:=bash}"
+mkdir -p "$ROOT/logs" "$ROOT/state"
+
+alive() { [ -f "$1" ] && kill -0 "$(cat "$1" 2>/dev/null)" 2>/dev/null; }
+note() { printf '%s [watchdog] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG"; }
+
+# mode sekali-check: tor-watchdog --once
+if [ "${1:-}" = "--once" ]; then
+  ok=0
+  alive "$PID_TOR" || ok=1
+  alive "$PID_PRIVOXY" || ok=1
+  if command -v check_tor >/dev/null 2>&1; then check_tor >/dev/null 2>&1 || ok=1; fi
+  if [ "$ok" -ne 0 ]; then note "UNHEALTHY -> restart"; emit health.fail '{"via":"watchdog-once"}' tor-watchdog; exec "$TORSTACK_BASH" "$ROOT/bin/torstack" start >> "$LOG" 2>&1; else echo "OK"; emit health.ok '{"via":"watchdog-once"}' tor-watchdog; fi
+  exit "$ok"
+fi
+
+note "watchdog start (interval=${INTERVAL}s)"
+emit watchdog.start "{\"interval\":$INTERVAL}" tor-watchdog
+while true; do
+  need=0
+  alive "$PID_TOR" || { note "tor mati -> restart"; emit health.fail '{"what":"tor-dead"}' tor-watchdog; need=1; }
+  alive "$PID_PRIVOXY" || { note "privoxy mati -> restart"; emit health.fail '{"what":"privoxy-dead"}' tor-watchdog; need=1; }
+  if [ "$need" -eq 0 ] && command -v check_tor >/dev/null 2>&1; then
+    check_tor >/dev/null 2>&1 || { note "check_tor gagal -> restart"; emit health.fail '{"what":"check-tor"}' tor-watchdog; need=1; }
+  fi
+  if [ "$need" -eq 1 ]; then emit watchdog.restart '{}' tor-watchdog; "$TORSTACK_BASH" "$ROOT/bin/torstack" start >> "$LOG" 2>&1 || true; fi
+  sleep "$INTERVAL"
+done
